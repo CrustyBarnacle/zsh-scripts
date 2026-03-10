@@ -1,0 +1,138 @@
+#!/bin/zsh
+
+# Function to display help
+show_help() {
+    cat << EOF
+Usage: sudo ./create_user.zsh
+
+This script creates a new user with the following features:
+  - Creates a new user account
+  - Sets up a home directory
+  - Sets default shell to /bin/zsh
+  - Sets user password
+  - Expires password in 30 days
+
+The script will prompt you for:
+  - Username
+  - Home directory path (default: /home/<username> if not specified)
+  - Password
+
+Requirements:
+  - Must be run with sudo/root privileges
+  - Username must not already exist
+
+Example:
+  sudo ./create_user.zsh
+
+EOF
+    exit 0
+}
+
+# Check if help is requested
+if [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    show_help
+fi
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    echo "Error: This script must be run as root or with sudo"
+    echo "Try: sudo $0"
+    exit 1
+fi
+
+# Prompt for username
+echo "=== Create New User ==="
+echo ""
+read "username?Enter username: "
+
+# Validate username
+if [[ -z "$username" ]]; then
+    echo "Error: Username cannot be empty"
+    exit 1
+fi
+
+# Check if user already exists
+if id "$username" &>/dev/null; then
+    echo "Error: User '$username' already exists"
+    exit 1
+fi
+
+# Prompt for home directory
+read "home_dir?Enter home directory path (default: /home/$username): "
+
+# Use default if empty
+if [[ -z "$home_dir" ]]; then
+    home_dir="/home/$username"
+fi
+
+# Prompt for password
+echo ""
+echo "Password requirements:"
+echo "  - Will be set to expire in 30 days"
+echo "  - User will be prompted to change on first login"
+echo ""
+read -s "password?Enter password for $username: "
+echo ""
+read -s "password_confirm?Confirm password: "
+echo ""
+
+# Validate passwords match
+if [[ "$password" != "$password_confirm" ]]; then
+    echo "Error: Passwords do not match"
+    exit 1
+fi
+
+if [[ -z "$password" ]]; then
+    echo "Error: Password cannot be empty"
+    exit 1
+fi
+
+echo ""
+echo "Creating user with the following settings:"
+echo "  Username: $username"
+echo "  Home directory: $home_dir"
+echo "  Shell: /bin/zsh"
+echo "  Password expiration: 30 days"
+echo ""
+
+# Create new user with specified home directory and shell
+useradd \
+  -d "$home_dir" \
+  -m \
+  -s /bin/zsh \
+  "$username"
+
+# Check if user was created successfully
+if [ $? -ne 0 ]; then
+    echo "Failed to create user '$username'"
+    exit 1
+fi
+
+echo "✔ User '$username' created successfully"
+
+# Set the user password and expire in 30 days using passwd
+printf "%s\n%s\n" "$password" "$password" | passwd -x 30 "$username" >/dev/null 2>&1
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to set password for '$username'"
+    exit 1
+fi
+
+echo "✔ Password set successfully with 30-day expiration"
+
+# Force password change on first login
+chage -d 0 "$username"
+
+if [ $? -ne 0 ]; then
+    echo "Warning: Failed to force password change on first login"
+else
+    echo "✔ Password will expire on first login (user must change it)"
+fi
+
+echo ""
+echo "=== Summary ==="
+echo "User '$username' has been created with:"
+echo "  Home directory: $home_dir"
+echo "  Default shell: /bin/zsh"
+echo "  Password expiration: 30 days"
+echo "  First login: User will be prompted to change password"

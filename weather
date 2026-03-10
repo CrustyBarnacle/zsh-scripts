@@ -1,0 +1,692 @@
+#!/bin/zsh
+
+# =============================================================================
+# weather.zsh — NOAA Weather CLI
+# =============================================================================
+# Fetches current conditions and forecast from the NWS API for a given location.
+# Output is suitable for desktop notifications, applets, status bars, or caching.
+#
+# NOAA API:  https://api.weather.gov
+# Format:    JSON-LD (https://json-ld.org/)
+#
+# Dependencies: curl, jq, bc 
+#
+# Usage:
+#   ./weather.zsh [OPTIONS]
+#
+# See --help for full usage.
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Defaults — Los Angeles, CA
+# ----------------------------------------------------------------------------
+DEFAULT_LAT="34.0803"
+DEFAULT_LON="-118.3617"
+DEFAULT_LOCATION_NAME="Los Angeles, CA"
+
+# User-Agent is required by the NWS API (no key needed, but UA must be set)
+USER_AGENT="weather.zsh/1.0 (zsh-scripts-collection; github-user)"
+
+# Cache settings
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/weather_zsh"
+CACHE_FILE="$CACHE_DIR/weather_cache.json"
+CACHE_TTL=600   # seconds (10 minutes)
+
+# Output formats
+FORMAT="summary"    # summary | full | json | notification | oneline
+
+# ----------------------------------------------------------------------------
+# Clothing recommendation thresholds (degrees F)
+# Override in config file: ~/.config/weather_zsh/config
+# ----------------------------------------------------------------------------
+LONG_SLEEVE_THRESHOLD=70   # suggest long sleeves at or below this temp
+JACKET_THRESHOLD=65        # suggest a jacket at or below this temp
+CLOTHING_ADVICE=true       # enabled by default for summary and notification
+
+# Config file — loaded after defaults so it can override any of the above
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/weather_zsh/config"
+
+# load_config: safely parse the config file.
+# Only the keys in ALLOWED_CONFIG_KEYS are accepted; all others are ignored.
+# Source is refused if the file is group- or world-writable (would allow
+# arbitrary code execution by other users or processes).
+ALLOWED_CONFIG_KEYS=(
+    LAT LON LOCATION_NAME
+    CACHE_TTL CACHE_DIR
+    LONG_SLEEVE_THRESHOLD JACKET_THRESHOLD CLOTHING_ADVICE
+)
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    # Refuse to load if file is group- or world-writable
+    local perms
+    if stat --version &>/dev/null 2>&1; then
+        perms=$(stat -c "%a" "$CONFIG_FILE")   # GNU stat
+    else
+        perms=$(stat -f "%OLp" "$CONFIG_FILE") # BSD/macOS stat
+    fi
+    if [[ "${perms: -2}" != "00" ]]; then
+        echo "Warning: config file '$CONFIG_FILE' is group/world-writable (permissions: $perms) — skipping for safety." >&2
+        echo "         Run: chmod 600 \"$CONFIG_FILE\"" >&2
+        return 1
+    fi
+
+    # Parse only allowed KEY=value lines; skip comments, blanks, and unknown keys
+    local allowed_pattern
+    allowed_pattern=$(IFS='|'; echo "${ALLOWED_CONFIG_KEYS[*]}")
+    while IFS='=' read -r key value; do
+        # Strip leading/trailing whitespace from key and value
+        key="${key//[[:space:]]/}"
+        value="${value#"${value%%[! ]*}"}"   # ltrim
+        value="${value%"${value##*[! ]}"}"   # rtrim
+        # Skip comments and blank lines
+        [[ "$key" == \#* || -z "$key" ]] && continue
+        # Only assign if key is in the allowlist
+        if [[ "$key" =~ ^($allowed_pattern)$ ]]; then
+            typeset -g "$key"="$value"
+        else
+            echo "Warning: unknown config key '$key' ignored." >&2
+        fi
+    done < "$CONFIG_FILE"
+}
+
+load_config
+
+# ----------------------------------------------------------------------------
+# Help
+# ----------------------------------------------------------------------------
+show_help() {
+    cat << EOF
+Usage: ./weather.zsh [OPTIONS]
+
+Fetches current weather and forecast from the NOAA/NWS public API.
+Default location: $DEFAULT_LOCATION_NAME ($DEFAULT_LAT, $DEFAULT_LON)
+
+OPTIONS:
+  -l, --lat LATITUDE        Latitude (decimal degrees)
+  --lon LONGITUDE           Longitude (decimal degrees)
+  -n, --name NAME           Human-readable location name (display only)
+  -f, --format FORMAT       Output format (default: summary)
+                              summary       Current conditions + today's forecast
+                              full          All available forecast periods
+                              json          Raw JSON from the NWS forecast endpoint
+                              notification  Single-line for desktop notifications
+                              oneline       Ultra-compact: "72°F Partly Cloudy"
+  -c, --cache               Use cached data if fresh (within ${CACHE_TTL}s)
+  --cache-ttl SECONDS       Override cache TTL (default: $CACHE_TTL)
+  --cache-dir PATH          Override cache directory (default: $CACHE_DIR)
+  --clear-cache             Invalidate cached data (truncates files in place) and exit
+  --no-cache                Bypass cache even if fresh
+  --clothing                Enable clothing recommendations (default: on)
+  --no-clothing             Disable clothing recommendations
+  -h, --help                Show this help message
+
+EXAMPLES:
+  # Default location (Los Angeles, CA), summary output
+  ./weather.zsh
+
+  # Custom location, notification format
+  ./weather.zsh --lat 40.7128 --lon -74.0060 --name "New York, NY" --format notification
+
+  # One-liner for a status bar / conky / waybar
+  ./weather.zsh --format oneline --cache
+
+  # Cache result to file for use by other scripts
+  ./weather.zsh --format json --cache > /tmp/weather_latest.json
+
+  # Force fresh fetch, full forecast
+  ./weather.zsh --no-cache --format full
+
+OUTPUT FORMATS:
+  summary       Human-readable block with current temp, conditions, wind,
+                humidity, and the next 2 forecast periods.
+  full          All forecast periods returned by the NWS (typically 14).
+  json          Raw NWS forecast JSON — pipe-friendly for jq or other tools.
+  notification  "📍 Los Angeles, CA | 72°F Partly Cloudy | Wind: SW 10 mph"
+  oneline       "72°F Partly Cloudy"
+
+CACHING:
+  Cache is stored in: $CACHE_DIR
+  Use --cache to read from cache when fresh, write on miss.
+  Use --no-cache to always fetch live data (still writes to cache).
+  Use --clear-cache to invalidate cached data (files are truncated, not deleted).
+
+CLOTHING RECOMMENDATIONS:
+  Shown automatically in summary and notification formats.
+  Default thresholds:
+    Long sleeves : at or below ${LONG_SLEEVE_THRESHOLD}°F
+    Jacket       : at or below ${JACKET_THRESHOLD}°F
+  Override thresholds in the config file:
+    $CONFIG_FILE
+  Example config file contents:
+    LONG_SLEEVE_THRESHOLD=68
+    JACKET_THRESHOLD=58
+    CLOTHING_ADVICE=true
+  Suppress for a single run: --no-clothing
+
+DEPENDENCIES:
+  curl    Used for all HTTP requests to api.weather.gov
+  jq      Used for JSON parsing
+  bc      Used for unit conversions (°C→°F, m/s→mph, Pa→inHg)
+
+NOTES:
+  - The NWS API requires a User-Agent header. No API key is needed.
+  - Coordinates must be within the continental US, Alaska, Hawaii, or
+    US territories covered by NWS.
+  - Grid office/gridX/gridY are resolved automatically from lat/lon.
+
+EOF
+    exit 0
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+LAT="$DEFAULT_LAT"
+LON="$DEFAULT_LON"
+LOCATION_NAME="$DEFAULT_LOCATION_NAME"
+USE_CACHE=false
+NO_CACHE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)       show_help ;;
+        -l|--lat)        LAT="$2";           shift 2 ;;
+        --lon)           LON="$2";           shift 2 ;;
+        -n|--name)       LOCATION_NAME="$2"; shift 2 ;;
+        -f|--format)     FORMAT="$2";        shift 2 ;;
+        -c|--cache)      USE_CACHE=true;          shift ;;
+        --no-cache)      NO_CACHE=true;           shift ;;
+        --clothing)      CLOTHING_ADVICE=true;    shift ;;
+        --no-clothing)   CLOTHING_ADVICE=false;   shift ;;
+        --cache-ttl)     CACHE_TTL="$2";     shift 2 ;;
+        --cache-dir)     CACHE_DIR="$2";     CACHE_FILE="$CACHE_DIR/weather_cache.json"; shift 2 ;;
+        --clear-cache)
+            # Invalidate cache by truncating files in place — no removal needed
+            local cleared=0
+            for f in "${CACHE_DIR}"/*.json; do
+                [[ -f "$f" ]] || continue
+                truncate -s 0 "$f"
+                echo "Cache invalidated: $f"
+                (( cleared++ ))
+            done
+            (( cleared == 0 )) && echo "No cache files found in: $CACHE_DIR"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Run with --help for usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Strip trailing commas and whitespace — common copy/paste and CLI artefact
+LAT="${LAT%%,*}"
+LAT="${LAT//[[:space:]]/}"
+LON="${LON%%,*}"
+LON="${LON//[[:space:]]/}"
+
+# Validate lat/lon — must be decimal numbers, optionally negative
+if [[ ! "$LAT" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: invalid latitude '$LAT' — expected a decimal number (e.g. 34.1478)" >&2
+    exit 1
+fi
+if [[ ! "$LON" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: invalid longitude '$LON' — expected a decimal number (e.g. -118.1445)" >&2
+    exit 1
+fi
+
+# ----------------------------------------------------------------------------
+# Dependency check
+# ----------------------------------------------------------------------------
+check_deps() {
+    local missing=()
+    for cmd in curl jq bc; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing[*]}" >&2
+        echo "Install them with your package manager, e.g.:" >&2
+        echo "  sudo apt install curl jq bc    # Debian/Ubuntu" >&2
+        echo "  sudo pacman -S curl jq bc      # Arch Linux" >&2
+        echo "  brew install curl jq bc        # macOS" >&2
+        exit 1
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# HTTP helper — sets NWS-required User-Agent, returns response body
+# ----------------------------------------------------------------------------
+nws_get() {
+    local url="$1"
+    local response
+    response=$(curl -s -f \
+        -H "User-Agent: $USER_AGENT" \
+        -H "Accept: application/geo+json" \
+        "$url" 2>&1)
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo "Error: HTTP request failed for URL: $url" >&2
+        echo "curl exit code: $exit_code" >&2
+        return 1
+    fi
+    echo "$response"
+}
+
+# ----------------------------------------------------------------------------
+# Cache helpers
+# ----------------------------------------------------------------------------
+cache_key() {
+    # Derive a simple cache key from lat/lon/format
+    echo "${LAT}_${LON}" | tr '.-' '_'
+}
+
+cache_is_fresh() {
+    local cache_file="$1"
+    [[ -f "$cache_file" ]] || return 1
+    [[ -s "$cache_file" ]] || return 1   # treat truncated (zero-byte) file as stale
+    local now
+    now=$(date +%s)
+    local mtime
+    # macOS vs Linux stat
+    if stat --version &>/dev/null 2>&1; then
+        mtime=$(stat -c %Y "$cache_file")
+    else
+        mtime=$(stat -f %m "$cache_file")
+    fi
+    local age=$(( now - mtime ))
+    [[ $age -lt $CACHE_TTL ]]
+}
+
+write_cache() {
+    local data="$1"
+    mkdir -p "$CACHE_DIR"
+    echo "$data" > "$CACHE_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# Fetch forecast data from NWS
+# Returns JSON with keys: forecast_json, location_name, current
+# ----------------------------------------------------------------------------
+fetch_weather() {
+    # Step 1: resolve grid from lat/lon
+    # NWS /points endpoint requires coordinates truncated to 4 decimal places —
+    # higher precision can cause the API to return an empty forecast URL
+    local lat_trunc lon_trunc
+    lat_trunc=$(printf "%.4f" "$LAT")
+    lon_trunc=$(printf "%.4f" "$LON")
+    local points_url="https://api.weather.gov/points/${lat_trunc},${lon_trunc}"
+    local points_resp
+    points_resp=$(nws_get "$points_url") || exit 1
+
+    # Extract forecast URL and station metadata
+    local forecast_url
+    forecast_url=$(echo "$points_resp" | jq -r '.properties.forecast // empty')
+    local forecast_hourly_url
+    forecast_hourly_url=$(echo "$points_resp" | jq -r '.properties.forecastHourly // empty')
+    local obs_stations_url
+    obs_stations_url=$(echo "$points_resp" | jq -r '.properties.observationStations // empty')
+    local city
+    city=$(echo "$points_resp" | jq -r '.properties.relativeLocation.properties.city // ""')
+    local state
+    state=$(echo "$points_resp" | jq -r '.properties.relativeLocation.properties.state // ""')
+
+    if [[ -z "$forecast_url" ]]; then
+        echo "Error: Could not resolve forecast URL for (${lat_trunc}, ${lon_trunc})." >&2
+        echo "The NWS API may not cover this location, or coordinates may be invalid." >&2
+        exit 1
+    fi
+
+    # Step 2: fetch 12h period forecast
+    local forecast_resp
+    forecast_resp=$(nws_get "$forecast_url") || exit 1
+
+    # Step 3: fetch latest observation from nearest station (for current conditions)
+    local current_json="{}"
+    if [[ -n "$obs_stations_url" ]]; then
+        local stations_resp
+        stations_resp=$(nws_get "$obs_stations_url") || true
+        local first_station
+        first_station=$(echo "$stations_resp" | jq -r '.features[0].id // empty')
+        if [[ -n "$first_station" ]]; then
+            local obs_url="${first_station}/observations/latest"
+            local obs_resp
+            obs_resp=$(nws_get "$obs_url") || true
+            if [[ -n "$obs_resp" ]]; then
+                current_json="$obs_resp"
+            fi
+        fi
+    fi
+
+    # Assemble composite payload and cache it
+    local payload
+    payload=$(jq -n \
+        --argjson forecast  "$forecast_resp" \
+        --argjson current   "$current_json" \
+        --arg     city      "$city" \
+        --arg     state     "$state" \
+        --arg     lat       "$LAT" \
+        --arg     lon       "$LON" \
+        --arg     loc_name  "$LOCATION_NAME" \
+        '{
+            fetched_at: (now | todate),
+            location: { name: $loc_name, city: $city, state: $state, lat: $lat, lon: $lon },
+            forecast: $forecast,
+            current:  $current
+        }')
+
+    write_cache "$payload"
+    echo "$payload"
+}
+
+# ----------------------------------------------------------------------------
+# Unit helpers
+# ----------------------------------------------------------------------------
+c_to_f() {
+    # $1: celsius (float or null)
+    local c="$1"
+    [[ "$c" == "null" || -z "$c" ]] && echo "N/A" && return
+    printf "%.0f" "$(echo "$c * 9/5 + 32" | bc -l)"
+}
+
+ms_to_mph() {
+    local ms="$1"
+    [[ "$ms" == "null" || -z "$ms" ]] && echo "N/A" && return
+    printf "%.0f" "$(echo "$ms * 2.23694" | bc -l)"
+}
+
+pa_to_inhg() {
+    local pa="$1"
+    [[ "$pa" == "null" || -z "$pa" ]] && echo "N/A" && return
+    printf "%.2f" "$(echo "$pa / 3386.39" | bc -l)"
+}
+
+# ----------------------------------------------------------------------------
+# Extract current observation fields from payload
+# ----------------------------------------------------------------------------
+parse_current() {
+    local payload="$1"
+    local props='.current.properties'
+
+    CURR_TEMP_C=$(echo "$payload"    | jq -r "${props}.temperature.value // \"null\"")
+    CURR_DEWPOINT_C=$(echo "$payload"| jq -r "${props}.dewpoint.value // \"null\"")
+    CURR_HUMIDITY=$(echo "$payload"  | jq -r "${props}.relativeHumidity.value // \"null\"")
+    CURR_WIND_DIR=$(echo "$payload"  | jq -r "${props}.windDirection.value // \"null\"")
+    CURR_WIND_MS=$(echo "$payload"   | jq -r "${props}.windSpeed.value // \"null\"")
+    CURR_GUST_MS=$(echo "$payload"   | jq -r "${props}.windGust.value // \"null\"")
+    CURR_PRESSURE=$(echo "$payload"  | jq -r "${props}.barometricPressure.value // \"null\"")
+    CURR_VISIBILITY=$(echo "$payload"| jq -r "${props}.visibility.value // \"null\"")
+    CURR_DESC=$(echo "$payload"      | jq -r "${props}.textDescription // \"N/A\"")
+    CURR_STATION=$(echo "$payload"   | jq -r "${props}.station // \"N/A\"")
+    CURR_TIMESTAMP=$(echo "$payload" | jq -r "${props}.timestamp // \"N/A\"")
+
+    CURR_TEMP_F=$(c_to_f "$CURR_TEMP_C")
+    CURR_WIND_MPH=$(ms_to_mph "$CURR_WIND_MS")
+    CURR_GUST_MPH=$(ms_to_mph "$CURR_GUST_MS")
+    CURR_PRESSURE_INHG=$(pa_to_inhg "$CURR_PRESSURE")
+
+    # Wind direction: degrees → compass
+    if [[ "$CURR_WIND_DIR" != "null" && -n "$CURR_WIND_DIR" ]]; then
+        local deg=$(printf "%.0f" "$CURR_WIND_DIR")
+        local dirs=(N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW)
+        local idx=$(( (deg + 11) / 22 % 16 ))
+        CURR_WIND_COMPASS="${dirs[$((idx+1))]}"
+    else
+        CURR_WIND_COMPASS="N/A"
+    fi
+
+    # Humidity: round if numeric
+    if [[ "$CURR_HUMIDITY" != "null" && -n "$CURR_HUMIDITY" ]]; then
+        CURR_HUMIDITY=$(printf "%.0f" "$CURR_HUMIDITY")
+    fi
+
+    # Visibility: meters → miles
+    if [[ "$CURR_VISIBILITY" != "null" && -n "$CURR_VISIBILITY" ]]; then
+        CURR_VIS_MILES=$(printf "%.1f" "$(echo "$CURR_VISIBILITY / 1609.34" | bc -l)")
+    else
+        CURR_VIS_MILES="N/A"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Clothing recommendation
+# Returns a string like "👕 Long sleeves recommended" or
+# "🧥 Jacket recommended" based on temp thresholds. Empty if no advice.
+# Only produces output when CLOTHING_ADVICE=true.
+# Expects an integer °F temp as $1.
+# ----------------------------------------------------------------------------
+clothing_advice() {
+    [[ "$CLOTHING_ADVICE" != "true" ]] && return
+    local temp_f="$1"
+    # Guard: skip if temp is not a plain integer, optionally negative (e.g. "N/A")
+    [[ "$temp_f" =~ ^-?[0-9]+$ ]] || return
+    if (( temp_f <= JACKET_THRESHOLD )); then
+        echo "🧥 Jacket recommended (below ${JACKET_THRESHOLD}°F)"
+    elif (( temp_f <= LONG_SLEEVE_THRESHOLD )); then
+        echo "👕 Long sleeves recommended (below ${LONG_SLEEVE_THRESHOLD}°F)"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Output renderers
+# ----------------------------------------------------------------------------
+
+render_oneline() {
+    local payload="$1"
+    parse_current "$payload"
+    # Fall back to first forecast period temp if no live obs
+    if [[ "$CURR_TEMP_F" == "N/A" ]]; then
+        local temp
+        temp=$(echo "$payload" | jq -r '.forecast.properties.periods[0].temperature // "N/A"')
+        local unit
+        unit=$(echo "$payload" | jq -r '.forecast.properties.periods[0].temperatureUnit // "F"')
+        CURR_TEMP_F="${temp}°${unit}"
+        CURR_DESC=$(echo "$payload" | jq -r '.forecast.properties.periods[0].shortForecast // "N/A"')
+    else
+        CURR_TEMP_F="${CURR_TEMP_F}°F"
+    fi
+    echo "${CURR_TEMP_F} ${CURR_DESC}"
+}
+
+render_notification() {
+    local payload="$1"
+    parse_current "$payload"
+    local loc
+    loc=$(echo "$payload" | jq -r '.location.name')
+
+    if [[ "$CURR_TEMP_F" == "N/A" ]]; then
+        local temp
+        temp=$(echo "$payload" | jq -r '.forecast.properties.periods[0].temperature // "N/A"')
+        local unit
+        unit=$(echo "$payload" | jq -r '.forecast.properties.periods[0].temperatureUnit // "F"')
+        CURR_TEMP_F="${temp}°${unit}"
+        CURR_DESC=$(echo "$payload" | jq -r '.forecast.properties.periods[0].shortForecast // "N/A"')
+        local wind
+        wind=$(echo "$payload" | jq -r '.forecast.properties.periods[0].windSpeed // "N/A"')
+        local wind_dir
+        wind_dir=$(echo "$payload" | jq -r '.forecast.properties.periods[0].windDirection // ""')
+        local notif="📍 ${loc} | ${CURR_TEMP_F} ${CURR_DESC} | Wind: ${wind_dir} ${wind}"
+        local advice
+        advice=$(clothing_advice "$temp")
+        [[ -n "$advice" ]] && notif="${notif} | ${advice}"
+        echo "$notif"
+    else
+        local advice
+        advice=$(clothing_advice "$CURR_TEMP_F")
+        local notif="📍 ${loc} | ${CURR_TEMP_F}°F ${CURR_DESC} | Wind: ${CURR_WIND_COMPASS} ${CURR_WIND_MPH} mph | Humidity: ${CURR_HUMIDITY}%"
+        [[ -n "$advice" ]] && notif="${notif} | ${advice}"
+        echo "$notif"
+    fi
+}
+
+render_summary() {
+    local payload="$1"
+    parse_current "$payload"
+
+    local loc
+    loc=$(echo "$payload" | jq -r '.location.name')
+    local fetched
+    fetched=$(echo "$payload" | jq -r '.fetched_at')
+    local nws_city
+    nws_city=$(echo "$payload" | jq -r '.location.city')
+    local nws_state
+    nws_state=$(echo "$payload" | jq -r '.location.state')
+
+    echo "╔══════════════════════════════════════════════════╗"
+    printf  "  🌤  Weather for: %-31s\n" "$loc"
+    [[ -n "$nws_city" && "$nws_city" != "null" ]] && \
+        printf "  📍 NWS Location: %s, %s\n" "$nws_city" "$nws_state"
+    printf  "  🕐 Updated:      %s\n" "$fetched"
+    echo "╠══════════════════════════════════════════════════╣"
+
+    echo "  CURRENT CONDITIONS"
+    echo "  ------------------"
+    if [[ "$CURR_TEMP_F" != "N/A" ]]; then
+        printf "  %-20s %s°F (%s°C)\n" "Temperature:"   "$CURR_TEMP_F"         "$(printf "%.1f" "${CURR_TEMP_C}")"
+        printf "  %-20s %s\n"          "Conditions:"    "$CURR_DESC"
+        printf "  %-20s %s%%\n"        "Humidity:"      "$CURR_HUMIDITY"
+        printf "  %-20s %s %s mph\n"   "Wind:"          "$CURR_WIND_COMPASS"   "$CURR_WIND_MPH"
+        [[ "$CURR_GUST_MPH" != "N/A" && "$CURR_GUST_MPH" != "0" ]] && \
+            printf "  %-20s %s mph\n"  "Gusts:"         "$CURR_GUST_MPH"
+        printf "  %-20s %s inHg\n"     "Pressure:"      "$CURR_PRESSURE_INHG"
+        printf "  %-20s %s mi\n"       "Visibility:"    "$CURR_VIS_MILES"
+        local advice
+        advice=$(clothing_advice "$CURR_TEMP_F")
+        [[ -n "$advice" ]] && printf "  %-20s %s\n" "Recommendation:" "$advice"
+    else
+        echo "  (Live observations unavailable — showing forecast)"
+        local fallback_temp
+        fallback_temp=$(echo "$payload" | jq -r '.forecast.properties.periods[0].temperature // "N/A"')
+        local advice
+        advice=$(clothing_advice "$fallback_temp")
+        [[ -n "$advice" ]] && printf "  %-20s %s\n" "Recommendation:" "$advice"
+    fi
+
+    echo ""
+    echo "  FORECAST"
+    echo "  --------"
+    local num_periods
+    num_periods=$(echo "$payload" | jq '.forecast.properties.periods | length')
+    local show=$(( num_periods < 4 ? num_periods : 4 ))
+
+    for i in $(seq 0 $(( show - 1 ))); do
+        local period_name
+        period_name=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].name")
+        local temp
+        temp=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].temperature")
+        local unit
+        unit=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].temperatureUnit")
+        local short
+        short=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].shortForecast")
+        local wind_speed
+        wind_speed=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].windSpeed")
+        local wind_dir
+        wind_dir=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].windDirection")
+        local precip
+        precip=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].probabilityOfPrecipitation.value // \"N/A\"")
+
+        printf "  %-18s %s°%s  %-28s  Wind: %s %s" \
+            "${period_name}:" "$temp" "$unit" "$short" "$wind_dir" "$wind_speed"
+        [[ "$precip" != "null" && "$precip" != "N/A" ]] && \
+            printf "  💧 %s%%" "$precip"
+        echo ""
+    done
+
+    echo "╚══════════════════════════════════════════════════╝"
+    echo "  Source: NOAA/NWS api.weather.gov"
+}
+
+render_full() {
+    local payload="$1"
+    parse_current "$payload"
+
+    local loc
+    loc=$(echo "$payload" | jq -r '.location.name')
+    local fetched
+    fetched=$(echo "$payload" | jq -r '.fetched_at')
+
+    echo "╔══════════════════════════════════════════════════╗"
+    printf  "  🌤  Full Forecast: %-30s\n" "$loc"
+    printf  "  🕐 Updated:       %s\n" "$fetched"
+    echo "╠══════════════════════════════════════════════════╣"
+
+    if [[ "$CURR_TEMP_F" != "N/A" ]]; then
+        echo "  CURRENT: ${CURR_TEMP_F}°F | ${CURR_DESC} | Wind: ${CURR_WIND_COMPASS} ${CURR_WIND_MPH} mph | Humidity: ${CURR_HUMIDITY}%"
+        echo ""
+    fi
+
+    echo "  7-DAY FORECAST"
+    echo "  --------------"
+    local num_periods
+    num_periods=$(echo "$payload" | jq '.forecast.properties.periods | length')
+
+    for i in $(seq 0 $(( num_periods - 1 ))); do
+        local period_name temp unit short wind_speed wind_dir precip detail
+        period_name=$(echo "$payload" | jq -r ".forecast.properties.periods[$i].name")
+        temp=$(echo "$payload"        | jq -r ".forecast.properties.periods[$i].temperature")
+        unit=$(echo "$payload"        | jq -r ".forecast.properties.periods[$i].temperatureUnit")
+        short=$(echo "$payload"       | jq -r ".forecast.properties.periods[$i].shortForecast")
+        wind_speed=$(echo "$payload"  | jq -r ".forecast.properties.periods[$i].windSpeed")
+        wind_dir=$(echo "$payload"    | jq -r ".forecast.properties.periods[$i].windDirection")
+        precip=$(echo "$payload"      | jq -r ".forecast.properties.periods[$i].probabilityOfPrecipitation.value // \"N/A\"")
+        detail=$(echo "$payload"      | jq -r ".forecast.properties.periods[$i].detailedForecast")
+
+        echo ""
+        printf "  ▸ %-16s %s°%s  —  %s\n" "${period_name}" "$temp" "$unit" "$short"
+        printf "    Wind: %s %s" "$wind_dir" "$wind_speed"
+        [[ "$precip" != "null" && "$precip" != "N/A" ]] && printf "  |  💧 Precip: %s%%" "$precip"
+        echo ""
+        echo "    $detail" | fold -s -w 72 | sed 's/^/    /'
+    done
+
+    echo ""
+    echo "╚══════════════════════════════════════════════════╝"
+    echo "  Source: NOAA/NWS api.weather.gov"
+}
+
+render_json() {
+    local payload="$1"
+    echo "$payload" | jq '.forecast'
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+    check_deps
+
+    local payload=""
+    local cache_path="${CACHE_DIR}/$(cache_key).json"
+
+    # Use per-location cache file
+    CACHE_FILE="$cache_path"
+
+    if [[ "$NO_CACHE" == false && "$USE_CACHE" == true ]] && cache_is_fresh "$CACHE_FILE"; then
+        payload=$(cat "$CACHE_FILE")
+    else
+        payload=$(fetch_weather)
+    fi
+
+    if [[ -z "$payload" ]]; then
+        echo "Error: Failed to retrieve weather data." >&2
+        exit 1
+    fi
+
+    case "$FORMAT" in
+        summary)      render_summary      "$payload" ;;
+        full)         render_full         "$payload" ;;
+        json)         render_json         "$payload" ;;
+        notification) render_notification "$payload" ;;
+        oneline)      render_oneline      "$payload" ;;
+        *)
+            echo "Error: Unknown format '$FORMAT'. Valid: summary, full, json, notification, oneline" >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
